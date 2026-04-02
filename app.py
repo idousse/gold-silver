@@ -1152,14 +1152,32 @@ def main():
         trade_data = []
         unit = "g" if use_grams else "oz"
         multiplier = oz_to_g if use_grams else 1
+        price_divisor = oz_to_g if use_grams else 1  # Convert price per oz to price per g
         
         for i, trade in enumerate(trades):
             gold_weight = trade.gold_ounces * multiplier
             silver_weight = trade.silver_ounces * multiplier
+            
+            # Determine which asset was bought and its price per unit
+            if trade.gold_ounces > 0 and trade.silver_ounces == 0:
+                # Bought gold only
+                price_per_unit = (trade.gold_price * exchange_rate) / price_divisor
+                price_str = f"{currency_symbol}{price_per_unit:.2f}/{unit}"
+            elif trade.silver_ounces > 0 and trade.gold_ounces == 0:
+                # Bought silver only
+                price_per_unit = (trade.silver_price * exchange_rate) / price_divisor
+                price_str = f"{currency_symbol}{price_per_unit:.2f}/{unit}"
+            else:
+                # Bought both (show both prices)
+                gold_ppu = (trade.gold_price * exchange_rate) / price_divisor
+                silver_ppu = (trade.silver_price * exchange_rate) / price_divisor
+                price_str = f"Au:{currency_symbol}{gold_ppu:.2f} Ag:{currency_symbol}{silver_ppu:.2f}/{unit}"
+            
             trade_data.append({
                 "Date": trade.date.strftime("%Y-%m-%d"),
                 "Action": trade.action.replace("_", " "),
                 "Ratio": f"{trade.ratio:.2f}",
+                f"Price/{unit}": price_str,
                 f"Gold ({unit})": f"{gold_weight:.2f}" if trade.gold_ounces > 0 else "-",
                 f"Silver ({unit})": f"{silver_weight:.2f}" if trade.silver_ounces > 0 else "-",
                 "Portfolio Value": format_currency(trade.portfolio_value * exchange_rate, selected_currency),
