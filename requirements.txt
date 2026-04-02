@@ -1,0 +1,8 @@
+backtesting
+pandas
+matplotlib
+yfinance
+numpy
+numpy-financial
+streamlit
+plotly

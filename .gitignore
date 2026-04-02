@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Old backtest script (not needed for web app)
+gold_silver_backtest.py
+
+# Backtest output images
+*.png
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cursor/IDE project files
+.cursor/
