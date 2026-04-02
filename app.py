@@ -162,9 +162,15 @@ st.markdown("""
         width: 100% !important;
     }
     
-    /* Faster sidebar toggle */
-    [data-testid="stSidebar"][aria-expanded="false"] {
-        display: none !important;
+    /* Always show sidebar toggle button */
+    [data-testid="stSidebar"] > div:first-child {
+        position: relative;
+    }
+    button[data-testid="stSidebarCollapseButton"],
+    button[data-testid="stSidebarExpandButton"] {
+        display: block !important;
+        visibility: visible !important;
+        opacity: 1 !important;
     }
 </style>
 """, unsafe_allow_html=True)
