@@ -884,7 +884,7 @@ def main():
             st.session_state.additional_investments[i]['date'] = new_date
         with col2:
             new_amount = col2.number_input(
-                f"€ {i+1}",
+                "€",
                 min_value=0,
                 value=inv['amount'],
                 step=1000,
