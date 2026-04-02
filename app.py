@@ -177,6 +177,73 @@ st.markdown("""
 
 
 # =============================================================================
+# CURRENCY CONFIGURATION
+# =============================================================================
+
+CURRENCIES = {
+    'EUR': {'symbol': '€', 'name': 'Euro', 'ticker': 'EURUSD=X'},
+    'USD': {'symbol': '$', 'name': 'US Dollar', 'ticker': None},
+    'GBP': {'symbol': '£', 'name': 'British Pound', 'ticker': 'GBPUSD=X'},
+    'CHF': {'symbol': 'CHF', 'name': 'Swiss Franc', 'ticker': 'CHFUSD=X'},
+    'JPY': {'symbol': '¥', 'name': 'Japanese Yen', 'ticker': 'JPYUSD=X'},
+    'CAD': {'symbol': 'C$', 'name': 'Canadian Dollar', 'ticker': 'CADUSD=X'},
+    'AUD': {'symbol': 'A$', 'name': 'Australian Dollar', 'ticker': 'AUDUSD=X'},
+    'CNY': {'symbol': '¥', 'name': 'Chinese Yuan', 'ticker': 'CNYUSD=X'},
+    'INR': {'symbol': '₹', 'name': 'Indian Rupee', 'ticker': 'INRUSD=X'},
+}
+
+@st.cache_data(ttl=3600)
+def get_exchange_rate(currency: str) -> float:
+    """Get exchange rate from USD to target currency."""
+    if currency == 'USD':
+        return 1.0
+    
+    try:
+        ticker_info = CURRENCIES.get(currency)
+        if not ticker_info or not ticker_info['ticker']:
+            return 1.0
+        
+        # For currencies like EURUSD=X, we get EUR per 1 USD
+        # We need to invert for some pairs
+        ticker = ticker_info['ticker']
+        
+        # Yahoo Finance uses format like EURUSD=X which gives USD per 1 EUR
+        # So we need the inverse ticker format
+        base_currency = currency
+        fx_ticker = f"{base_currency}USD=X"
+        
+        # Try to get the rate
+        fx = yf.Ticker(fx_ticker)
+        rate = fx.info.get('regularMarketPrice', fx.info.get('previousClose', None))
+        
+        if rate and rate > 0:
+            # This gives us USD per 1 unit of foreign currency
+            # We need foreign currency per 1 USD, so invert
+            return 1.0 / rate
+        
+        # Fallback: try the reverse ticker
+        fx_ticker_reverse = f"USD{base_currency}=X"
+        fx = yf.Ticker(fx_ticker_reverse)
+        rate = fx.info.get('regularMarketPrice', fx.info.get('previousClose', None))
+        
+        if rate and rate > 0:
+            return rate
+            
+    except Exception:
+        pass
+    
+    return 1.0
+
+
+def format_currency(value: float, currency: str, decimals: int = 2) -> str:
+    """Format a value in the specified currency."""
+    symbol = CURRENCIES.get(currency, {}).get('symbol', '$')
+    if decimals == 0:
+        return f"{symbol}{value:,.0f}"
+    return f"{symbol}{value:,.{decimals}f}"
+
+
+# =============================================================================
 # DATA FETCHING
 # =============================================================================
 
@@ -696,22 +763,23 @@ def create_ounces_chart(portfolio_df: pd.DataFrame, trades: List[Trade],
 
 
 def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFrame,
-                           initial_capital: float) -> go.Figure:
+                           initial_capital: float, exchange_rate: float = 1.0,
+                           currency_symbol: str = '$') -> go.Figure:
     """Create portfolio value chart vs benchmarks."""
     
     fig = go.Figure()
     
-    # Strategy
+    # Strategy (convert to selected currency)
     fig.add_trace(go.Scatter(
         x=portfolio_df.index,
-        y=portfolio_df['portfolio_value'],
+        y=portfolio_df['portfolio_value'] * exchange_rate,
         mode='lines',
         name='Strategy',
         line=dict(color='#6366f1', width=3)
     ))
     
     # Gold buy & hold
-    gold_normalized = (trading_data['GLD'] / trading_data['GLD'].iloc[0]) * initial_capital
+    gold_normalized = (trading_data['GLD'] / trading_data['GLD'].iloc[0]) * initial_capital * exchange_rate
     fig.add_trace(go.Scatter(
         x=trading_data.index,
         y=gold_normalized,
@@ -721,7 +789,7 @@ def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFram
     ))
     
     # Silver buy & hold
-    silver_normalized = (trading_data['SLV'] / trading_data['SLV'].iloc[0]) * initial_capital
+    silver_normalized = (trading_data['SLV'] / trading_data['SLV'].iloc[0]) * initial_capital * exchange_rate
     fig.add_trace(go.Scatter(
         x=trading_data.index,
         y=silver_normalized,
@@ -733,7 +801,7 @@ def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFram
     fig.update_layout(
         title="Portfolio Value: Switching vs Buy & Hold",
         xaxis_title="Date",
-        yaxis_title="Value ($)",
+        yaxis_title=f"Value ({currency_symbol})",
         height=400,
         template="plotly_white",
         hovermode='x unified',
@@ -754,6 +822,16 @@ def main():
     
     # Sidebar - Parameters
     st.sidebar.header("⚙️ Parameters")
+    
+    st.sidebar.subheader("💱 Currency")
+    currency_options = [f"{code} ({info['symbol']}) - {info['name']}" for code, info in CURRENCIES.items()]
+    currency_index = list(CURRENCIES.keys()).index('EUR')  # Default to EUR
+    selected_currency_option = st.sidebar.selectbox("Display currency", currency_options, index=currency_index)
+    selected_currency = selected_currency_option.split(' ')[0]
+    currency_symbol = CURRENCIES[selected_currency]['symbol']
+    
+    # Get exchange rate
+    exchange_rate = get_exchange_rate(selected_currency)
     
     st.sidebar.subheader("📅 Date Range")
     col1, col2 = st.sidebar.columns(2)
@@ -778,8 +856,12 @@ def main():
         st.session_state.prev_end_date = end_date
     
     st.sidebar.subheader("💰 Investment")
-    initial_capital = st.sidebar.number_input("Initial Investment ($)", min_value=100, value=10000, step=1000)
-    monthly_contribution = st.sidebar.number_input("Monthly Contribution ($)", min_value=0, value=0, step=50)
+    initial_capital_input = st.sidebar.number_input(f"Initial Investment ({currency_symbol})", min_value=100, value=10000, step=1000)
+    monthly_contribution_input = st.sidebar.number_input(f"Monthly Contribution ({currency_symbol})", min_value=0, value=0, step=50)
+    
+    # Convert inputs from selected currency to USD for internal calculations
+    initial_capital = initial_capital_input / exchange_rate if exchange_rate > 0 else initial_capital_input
+    monthly_contribution = monthly_contribution_input / exchange_rate if exchange_rate > 0 else monthly_contribution_input
     
     # Additional investments
     st.sidebar.subheader("💵 Additional Investments")
@@ -803,7 +885,7 @@ def main():
             st.session_state.additional_investments[i]['date'] = new_date
         with col2:
             new_amount = col2.number_input(
-                f"Amount {i+1}",
+                f"{currency_symbol} {i+1}",
                 min_value=0,
                 value=inv['amount'],
                 step=1000,
@@ -826,8 +908,9 @@ def main():
         })
         st.rerun()
     
-    # Convert to list for backtest
-    additional_investments = [(inv['date'], inv['amount']) for inv in st.session_state.additional_investments]
+    # Convert to list for backtest (convert from selected currency to USD)
+    additional_investments = [(inv['date'], inv['amount'] / exchange_rate if exchange_rate > 0 else inv['amount']) 
+                              for inv in st.session_state.additional_investments]
     
     st.sidebar.subheader("📊 Strategy Mode")
     strategy_mode = st.sidebar.radio("Mode", ["Automatic", "Manual"], horizontal=True)
@@ -924,67 +1007,83 @@ def main():
     use_grams = weight_unit == "g (grams)"
     oz_to_g = 31.1035  # conversion factor
     
-    # Live ratio display
-    live_ratio, gold_price, silver_price = get_live_ratio()
-    
-    if live_ratio:
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.markdown(f"""
-            <div class="metric-card" style="padding: 2rem;">
-                <div class="metric-value-large">{live_ratio:.2f}</div>
-                <div class="metric-label-large">Current Gold/Silver Ratio</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown(f"""
-            <div class="metric-card gold-metric" style="padding: 0.8rem; margin-bottom: 0.5rem;">
-                <div class="metric-value-small">${gold_price:,.2f}</div>
-                <div class="metric-label-small">Gold (per oz)</div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown(f"""
-            <div class="metric-card silver-metric" style="padding: 0.8rem;">
-                <div class="metric-value-small">${silver_price:.2f}</div>
-                <div class="metric-label-small">Silver (per oz)</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Current action recommendation (only in automatic mode)
-        if upper_threshold is not None and lower_threshold is not None:
-            st.markdown("---")
-            signal_col, disclaimer_col = st.columns([2, 1])
-            
-            with signal_col:
-                if live_ratio >= upper_threshold:
-                    st.markdown(f'<div class="action-buy-silver">📍 Current Signal: BUY SILVER (Ratio {live_ratio:.2f} ≥ {upper_threshold})</div>', unsafe_allow_html=True)
-                elif live_ratio <= lower_threshold:
-                    st.markdown(f'<div class="action-buy-gold">📍 Current Signal: BUY GOLD (Ratio {live_ratio:.2f} ≤ {lower_threshold})</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="action-hold">📍 Current Signal: HOLD (Ratio {live_ratio:.2f} between {lower_threshold}-{upper_threshold})</div>', unsafe_allow_html=True)
-            
-            with disclaimer_col:
-                st.markdown("""
-                <div style="color: #c0c0c0; font-size: 1rem; font-style: italic; padding: 0.5rem; text-align: center;">
-                    ⚠️ This is what I would do based on this strategy.<br>
-                    <strong>Not financial advice.</strong> For educational purposes only.
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.markdown("---")
-            st.markdown('<div class="action-hold">📍 Manual Mode - No automatic signal</div>', unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Fetch and process data
+    # Fetch and process data first (needed for fallback)
     with st.spinner("Fetching market data..."):
         ratio_data, trading_data = fetch_data(str(start_date), str(end_date))
     
     if len(ratio_data) == 0:
         st.error("No data available for the selected date range.")
         return
+    
+    # Live ratio display (with fallback to most recent historical data)
+    live_ratio, gold_price_usd, silver_price_usd = get_live_ratio()
+    
+    # Use historical data as fallback if live data unavailable
+    is_live = live_ratio is not None
+    if not is_live:
+        live_ratio = ratio_data['ratio'].iloc[-1]
+        gold_price_usd = ratio_data['gold_price'].iloc[-1]
+        silver_price_usd = ratio_data['silver_price'].iloc[-1]
+        last_date = ratio_data.index[-1].strftime("%Y-%m-%d")
+    
+    # Convert prices to selected currency
+    gold_price_display = gold_price_usd * exchange_rate
+    silver_price_display = silver_price_usd * exchange_rate
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        ratio_label = "Current Gold/Silver Ratio" if is_live else f"Latest Gold/Silver Ratio ({last_date})"
+        st.markdown(f"""
+        <div class="metric-card" style="padding: 2rem;">
+            <div class="metric-value-large">{live_ratio:.2f}</div>
+            <div class="metric-label-large">{ratio_label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card gold-metric" style="padding: 0.8rem; margin-bottom: 0.5rem;">
+            <div class="metric-value-small">{format_currency(gold_price_display, selected_currency)}</div>
+            <div class="metric-label-small">Gold (per oz)</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-card silver-metric" style="padding: 0.8rem;">
+            <div class="metric-value-small">{format_currency(silver_price_display, selected_currency)}</div>
+            <div class="metric-label-small">Silver (per oz)</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Show warning if using historical data
+    if not is_live:
+        st.caption("⚠️ Live prices unavailable. Showing most recent historical data.")
+    
+    # Current action recommendation (only in automatic mode)
+    if upper_threshold is not None and lower_threshold is not None:
+        st.markdown("---")
+        signal_col, disclaimer_col = st.columns([2, 1])
+        
+        with signal_col:
+            if live_ratio >= upper_threshold:
+                st.markdown(f'<div class="action-buy-silver">📍 Current Signal: BUY SILVER (Ratio {live_ratio:.2f} ≥ {upper_threshold})</div>', unsafe_allow_html=True)
+            elif live_ratio <= lower_threshold:
+                st.markdown(f'<div class="action-buy-gold">📍 Current Signal: BUY GOLD (Ratio {live_ratio:.2f} ≤ {lower_threshold})</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="action-hold">📍 Current Signal: HOLD (Ratio {live_ratio:.2f} between {lower_threshold}-{upper_threshold})</div>', unsafe_allow_html=True)
+        
+        with disclaimer_col:
+            st.markdown("""
+            <div style="color: #c0c0c0; font-size: 1rem; font-style: italic; padding: 0.5rem; text-align: center;">
+                ⚠️ This is what I would do based on this strategy.<br>
+                <strong>Not financial advice.</strong> For educational purposes only.
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.markdown("---")
+        st.markdown('<div class="action-hold">📍 Manual Mode - No automatic signal</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
     
     # Run backtest
     portfolio_df, trades, total_contributions = run_backtest(
@@ -1006,11 +1105,11 @@ def main():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Invested", f"${metrics['total_contributions']:,.0f}")
+        st.metric("Total Invested", format_currency(metrics['total_contributions'] * exchange_rate, selected_currency, 0))
     with col2:
-        st.metric("Final Value", f"${metrics['final_value']:,.0f}")
+        st.metric("Final Value", format_currency(metrics['final_value'] * exchange_rate, selected_currency, 0))
     with col3:
-        st.metric("Profit", f"${metrics['profit']:,.0f}", 
+        st.metric("Profit", format_currency(metrics['profit'] * exchange_rate, selected_currency, 0), 
                   delta=f"{metrics['total_return']:.1f}%")
     with col4:
         st.metric("Annual Return", f"{metrics['annualized_return']:.2f}%")
@@ -1043,7 +1142,7 @@ def main():
     st.plotly_chart(ounces_chart, use_container_width=True)
     
     st.subheader("💹 Portfolio Value")
-    portfolio_chart = create_portfolio_chart(portfolio_df, trading_data, initial_capital)
+    portfolio_chart = create_portfolio_chart(portfolio_df, trading_data, initial_capital, exchange_rate, currency_symbol)
     st.plotly_chart(portfolio_chart, use_container_width=True)
     
     # Trade History
@@ -1063,20 +1162,21 @@ def main():
                 "Ratio": f"{trade.ratio:.2f}",
                 f"Gold ({unit})": f"{gold_weight:.2f}" if trade.gold_ounces > 0 else "-",
                 f"Silver ({unit})": f"{silver_weight:.2f}" if trade.silver_ounces > 0 else "-",
-                "Portfolio Value": f"${trade.portfolio_value:,.2f}",
-                "Fee": f"${trade.transaction_cost:.2f}"
+                "Portfolio Value": format_currency(trade.portfolio_value * exchange_rate, selected_currency),
+                "Fee": format_currency(trade.transaction_cost * exchange_rate, selected_currency)
             })
         
         st.dataframe(pd.DataFrame(trade_data), use_container_width=True, hide_index=True)
         
         total_fees = sum(t.transaction_cost for t in trades)
-        st.info(f"**Total Trades:** {len(trades)} | **Total Fees Paid:** ${total_fees:,.2f}")
+        st.info(f"**Total Trades:** {len(trades)} | **Total Fees Paid:** {format_currency(total_fees * exchange_rate, selected_currency)}")
     
     # Footer
     st.markdown("---")
-    st.markdown("""
+    exchange_rate_note = f" | Exchange rate: 1 USD = {exchange_rate:.4f} {selected_currency}" if selected_currency != 'USD' else ""
+    st.markdown(f"""
     <div style="text-align: center; color: #888; font-size: 0.9rem;">
-        <p>Data source: Yahoo Finance (GC=F, SI=F futures) | Updated daily</p>
+        <p>Data source: Yahoo Finance (GC=F, SI=F futures) | Updated daily{exchange_rate_note}</p>
         <p>⚠️ This is for educational purposes only. Past performance does not guarantee future results.</p>
     </div>
     """, unsafe_allow_html=True)
