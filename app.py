@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import os
 
 # Page config
@@ -177,70 +177,61 @@ st.markdown("""
 
 
 # =============================================================================
-# CURRENCY CONFIGURATION
+# EURO (historical EUR/USD)
 # =============================================================================
 
-CURRENCIES = {
-    'EUR': {'symbol': '€', 'name': 'Euro', 'ticker': 'EURUSD=X'},
-    'USD': {'symbol': '$', 'name': 'US Dollar', 'ticker': None},
-    'GBP': {'symbol': '£', 'name': 'British Pound', 'ticker': 'GBPUSD=X'},
-    'CHF': {'symbol': 'CHF', 'name': 'Swiss Franc', 'ticker': 'CHFUSD=X'},
-    'JPY': {'symbol': '¥', 'name': 'Japanese Yen', 'ticker': 'JPYUSD=X'},
-    'CAD': {'symbol': 'C$', 'name': 'Canadian Dollar', 'ticker': 'CADUSD=X'},
-    'AUD': {'symbol': 'A$', 'name': 'Australian Dollar', 'ticker': 'AUDUSD=X'},
-    'CNY': {'symbol': '¥', 'name': 'Chinese Yuan', 'ticker': 'CNYUSD=X'},
-    'INR': {'symbol': '₹', 'name': 'Indian Rupee', 'ticker': 'INRUSD=X'},
-}
+def _yf_close_series(df: pd.DataFrame) -> pd.Series:
+    """Extract Close as a single Series from yfinance output."""
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        c = df['Close']
+        return c.iloc[:, 0] if isinstance(c, pd.DataFrame) else c
+    return df['Close']
+
+
+def fetch_eurusd_series(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.Series:
+    """Daily EURUSD=X (USD per 1 EUR). Index: dates."""
+    pad_start = (start_ts - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+    end_pad = (end_ts + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    fx = yf.download("EURUSD=X", start=pad_start, end=end_pad, progress=False)
+    s = _yf_close_series(fx)
+    if len(s) == 0:
+        return s
+    s = s.sort_index()
+    return s[~s.index.duplicated(keep='last')]
+
+
+def align_eurusd(eurusd: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    """Reindex EURUSD to metal dates; forward-fill FX holidays."""
+    if len(eurusd) == 0:
+        return pd.Series(1.0, index=index)
+    aligned = eurusd.reindex(index).ffill().bfill()
+    aligned = aligned.ffill().bfill()
+    return aligned.fillna(1.0)
+
+
+def format_eur(value: float, decimals: int = 2) -> str:
+    if decimals == 0:
+        return f"€{value:,.0f}"
+    return f"€{value:,.{decimals}f}"
+
+
+# Yahoo futures quotes are per troy ounce; UI shows metal weights in grams
+OZ_TO_G = 31.1035
+
 
 @st.cache_data(ttl=3600)
-def get_exchange_rate(currency: str) -> float:
-    """Get exchange rate from USD to target currency."""
-    if currency == 'USD':
-        return 1.0
-    
+def get_spot_eurusd() -> Optional[float]:
+    """Current EURUSD (USD per 1 EUR) for live USD metal quotes."""
     try:
-        ticker_info = CURRENCIES.get(currency)
-        if not ticker_info or not ticker_info['ticker']:
-            return 1.0
-        
-        # For currencies like EURUSD=X, we get EUR per 1 USD
-        # We need to invert for some pairs
-        ticker = ticker_info['ticker']
-        
-        # Yahoo Finance uses format like EURUSD=X which gives USD per 1 EUR
-        # So we need the inverse ticker format
-        base_currency = currency
-        fx_ticker = f"{base_currency}USD=X"
-        
-        # Try to get the rate
-        fx = yf.Ticker(fx_ticker)
-        rate = fx.info.get('regularMarketPrice', fx.info.get('previousClose', None))
-        
-        if rate and rate > 0:
-            # This gives us USD per 1 unit of foreign currency
-            # We need foreign currency per 1 USD, so invert
-            return 1.0 / rate
-        
-        # Fallback: try the reverse ticker
-        fx_ticker_reverse = f"USD{base_currency}=X"
-        fx = yf.Ticker(fx_ticker_reverse)
-        rate = fx.info.get('regularMarketPrice', fx.info.get('previousClose', None))
-        
-        if rate and rate > 0:
-            return rate
-            
+        fx = yf.Ticker("EURUSD=X")
+        r = fx.info.get('regularMarketPrice', fx.info.get('previousClose'))
+        if r is not None and float(r) > 0:
+            return float(r)
     except Exception:
         pass
-    
-    return 1.0
-
-
-def format_currency(value: float, currency: str, decimals: int = 2) -> str:
-    """Format a value in the specified currency."""
-    symbol = CURRENCIES.get(currency, {}).get('symbol', '$')
-    if decimals == 0:
-        return f"{symbol}{value:,.0f}"
-    return f"{symbol}{value:,.{decimals}f}"
+    return None
 
 
 # =============================================================================
@@ -279,8 +270,12 @@ def fetch_recent_data(last_date: str) -> pd.DataFrame:
     
     return recent
 
-def fetch_data(start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Fetch data from CSV + recent yfinance data."""
+def fetch_data(start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Fetch data from CSV + recent yfinance data.
+    
+    Gold/silver prices in trading_data and ratio_data are in EUR per troy ounce,
+    using historical EURUSD=X per calendar day (USD per 1 EUR).
+    """
     
     # Load historical data from CSV
     csv_data = load_csv_data()
@@ -320,14 +315,26 @@ def fetch_data(start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFra
     end_ts = pd.Timestamp(end_date)
     all_data = all_data[(all_data.index >= start_ts) & (all_data.index <= end_ts)]
     
-    # Create ratio_data and trading_data
-    ratio_data = all_data[['gold_price', 'silver_price', 'ratio']].copy()
+    if len(all_data) == 0:
+        empty = pd.DataFrame()
+        return empty, empty, pd.Series(dtype=float)
     
-    trading_data = pd.DataFrame()
-    trading_data['GLD'] = all_data['gold_price']
-    trading_data['SLV'] = all_data['silver_price']
+    eurusd_hist = fetch_eurusd_series(all_data.index.min(), all_data.index.max())
+    eurusd_aligned = align_eurusd(eurusd_hist, all_data.index)
     
-    return ratio_data, trading_data
+    # USD/oz -> EUR/oz: divide by EURUSD (USD per 1 EUR)
+    gold_eur = all_data['gold_price'] / eurusd_aligned
+    silver_eur = all_data['silver_price'] / eurusd_aligned
+    
+    ratio_data = pd.DataFrame({
+        'gold_price': gold_eur,
+        'silver_price': silver_eur,
+        'ratio': all_data['ratio'],
+    }, index=all_data.index)
+    
+    trading_data = pd.DataFrame({'GLD': gold_eur, 'SLV': silver_eur}, index=all_data.index)
+    
+    return ratio_data, trading_data, eurusd_aligned
 
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -366,9 +373,14 @@ def run_backtest(ratio_data: pd.DataFrame, trading_data: pd.DataFrame,
                  initial_capital: float, monthly_contribution: float,
                  upper_threshold: float, lower_threshold: float,
                  transaction_fee: float,
+                 storage_fee_monthly: float = 0.0,
                  additional_investments: List[Tuple] = None,
-                 manual_trades: List[Tuple] = None) -> Tuple[pd.DataFrame, List[Trade], float]:
-    """Run the backtest with given parameters."""
+                 manual_trades: List[Tuple] = None) -> Tuple[pd.DataFrame, List[Trade], float, float]:
+    """Run the backtest with given parameters.
+    
+    Returns:
+        Tuple of (portfolio_df, trades, total_contributions, total_storage_fees)
+    """
     
     if additional_investments is None:
         additional_investments = []
@@ -398,10 +410,12 @@ def run_backtest(ratio_data: pd.DataFrame, trading_data: pd.DataFrame,
     trades = []
     portfolio_history = []
     total_contributions = initial_capital
+    total_storage_fees = 0.0
     
     current_allocation = None
     current_gold_pct = None
     last_contribution_month = None
+    last_storage_fee_month = None
     processed_additional_invs = set()
     processed_manual_trades = set()
     
@@ -452,6 +466,18 @@ def run_backtest(ratio_data: pd.DataFrame, trading_data: pd.DataFrame,
                 
                 total_contributions += contribution
                 last_contribution_month = current_month
+        
+        # Apply monthly storage fee (deduct from holdings)
+        if storage_fee_monthly > 0 and (gold_shares > 0 or silver_shares > 0):
+            if last_storage_fee_month is None or current_month != last_storage_fee_month:
+                # Calculate storage fee based on current value
+                storage_fee_value = (gold_shares * gold_price + silver_shares * silver_price) * storage_fee_monthly
+                total_storage_fees += storage_fee_value
+                
+                # Deduct proportionally from holdings (reduce ounces)
+                gold_shares *= (1 - storage_fee_monthly)
+                silver_shares *= (1 - storage_fee_monthly)
+                last_storage_fee_month = current_month
         
         portfolio_value = gold_shares * gold_price + silver_shares * silver_price + cash
         
@@ -553,7 +579,7 @@ def run_backtest(ratio_data: pd.DataFrame, trading_data: pd.DataFrame,
     portfolio_df = pd.DataFrame(portfolio_history)
     portfolio_df.set_index('date', inplace=True)
     
-    return portfolio_df, trades, total_contributions
+    return portfolio_df, trades, total_contributions, total_storage_fees
 
 
 def calculate_metrics(portfolio_df: pd.DataFrame, total_contributions: float,
@@ -698,56 +724,47 @@ def create_ratio_chart(ratio_data: pd.DataFrame, portfolio_df: pd.DataFrame,
     return fig
 
 
-def create_ounces_chart(portfolio_df: pd.DataFrame, trades: List[Trade], 
-                        use_grams: bool = False) -> go.Figure:
-    """Create chart showing weight of gold/silver over time."""
-    
-    oz_to_g = 31.1035
-    unit = "g" if use_grams else "oz"
-    unit_label = "Grams" if use_grams else "Ounces"
-    multiplier = oz_to_g if use_grams else 1
+def create_holdings_grams_chart(portfolio_df: pd.DataFrame, trades: List[Trade]) -> go.Figure:
+    """Create chart showing gold/silver weight over time (grams)."""
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        subplot_titles=(f"Gold ({unit_label})", f"Silver ({unit_label})"),
+                        subplot_titles=("Gold (g)", "Silver (g)"),
                         vertical_spacing=0.1)
     
-    # Gold
     fig.add_trace(go.Scatter(
         x=portfolio_df.index,
-        y=portfolio_df['gold_ounces'] * multiplier,
+        y=portfolio_df['gold_ounces'] * OZ_TO_G,
         fill='tozeroy',
         fillcolor='rgba(255, 215, 0, 0.3)',
         line=dict(color='#d4a017', width=2),
-        name=f'Gold ({unit_label})'
+        name='Gold (g)'
     ), row=1, col=1)
     
-    # Silver
     fig.add_trace(go.Scatter(
         x=portfolio_df.index,
-        y=portfolio_df['silver_ounces'] * multiplier,
+        y=portfolio_df['silver_ounces'] * OZ_TO_G,
         fill='tozeroy',
         fillcolor='rgba(192, 192, 192, 0.4)',
         line=dict(color='#808080', width=2),
-        name=f'Silver ({unit_label})'
+        name='Silver (g)'
     ), row=2, col=1)
     
-    # Add trade markers
     for trade in trades:
-        gold_weight = trade.gold_ounces * multiplier
-        silver_weight = trade.silver_ounces * multiplier
+        gold_g = trade.gold_ounces * OZ_TO_G
+        silver_g = trade.silver_ounces * OZ_TO_G
         
         fig.add_trace(go.Scatter(
-            x=[trade.date], y=[gold_weight],
+            x=[trade.date], y=[gold_g],
             mode='markers', marker=dict(size=10, color='#d4a017', symbol='diamond'),
             showlegend=False,
-            hovertemplate=f"<b>{trade.action}</b><br>Gold: {gold_weight:.2f} {unit}<extra></extra>"
+            hovertemplate=f"<b>{trade.action}</b><br>Gold: {gold_g:.2f} g<extra></extra>"
         ), row=1, col=1)
         
         fig.add_trace(go.Scatter(
-            x=[trade.date], y=[silver_weight],
+            x=[trade.date], y=[silver_g],
             mode='markers', marker=dict(size=10, color='#808080', symbol='diamond'),
             showlegend=False,
-            hovertemplate=f"<b>{trade.action}</b><br>Silver: {silver_weight:.2f} {unit}<extra></extra>"
+            hovertemplate=f"<b>{trade.action}</b><br>Silver: {silver_g:.2f} g<extra></extra>"
         ), row=2, col=1)
     
     fig.update_layout(
@@ -756,30 +773,27 @@ def create_ounces_chart(portfolio_df: pd.DataFrame, trades: List[Trade],
         showlegend=False
     )
     
-    fig.update_yaxes(title_text=unit_label, row=1, col=1)
-    fig.update_yaxes(title_text=unit_label, row=2, col=1)
+    fig.update_yaxes(title_text="g", row=1, col=1)
+    fig.update_yaxes(title_text="g", row=2, col=1)
     
     return fig
 
 
 def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFrame,
-                           initial_capital: float, exchange_rate: float = 1.0,
-                           currency_symbol: str = '$') -> go.Figure:
-    """Create portfolio value chart vs benchmarks."""
+                           initial_capital: float) -> go.Figure:
+    """Create portfolio value chart vs benchmarks (amounts in EUR)."""
     
     fig = go.Figure()
     
-    # Strategy (convert to selected currency)
     fig.add_trace(go.Scatter(
         x=portfolio_df.index,
-        y=portfolio_df['portfolio_value'] * exchange_rate,
+        y=portfolio_df['portfolio_value'],
         mode='lines',
         name='Strategy',
         line=dict(color='#6366f1', width=3)
     ))
     
-    # Gold buy & hold
-    gold_normalized = (trading_data['GLD'] / trading_data['GLD'].iloc[0]) * initial_capital * exchange_rate
+    gold_normalized = (trading_data['GLD'] / trading_data['GLD'].iloc[0]) * initial_capital
     fig.add_trace(go.Scatter(
         x=trading_data.index,
         y=gold_normalized,
@@ -788,8 +802,7 @@ def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFram
         line=dict(color='#d4a017', width=2, dash='dot')
     ))
     
-    # Silver buy & hold
-    silver_normalized = (trading_data['SLV'] / trading_data['SLV'].iloc[0]) * initial_capital * exchange_rate
+    silver_normalized = (trading_data['SLV'] / trading_data['SLV'].iloc[0]) * initial_capital
     fig.add_trace(go.Scatter(
         x=trading_data.index,
         y=silver_normalized,
@@ -801,7 +814,7 @@ def create_portfolio_chart(portfolio_df: pd.DataFrame, trading_data: pd.DataFram
     fig.update_layout(
         title="Portfolio Value: Switching vs Buy & Hold",
         xaxis_title="Date",
-        yaxis_title=f"Value ({currency_symbol})",
+        yaxis_title="Value (€)",
         height=400,
         template="plotly_white",
         hovermode='x unified',
@@ -822,16 +835,6 @@ def main():
     
     # Sidebar - Parameters
     st.sidebar.header("⚙️ Parameters")
-    
-    st.sidebar.subheader("💱 Currency")
-    currency_options = [f"{code} ({info['symbol']}) - {info['name']}" for code, info in CURRENCIES.items()]
-    currency_index = list(CURRENCIES.keys()).index('EUR')  # Default to EUR
-    selected_currency_option = st.sidebar.selectbox("Display currency", currency_options, index=currency_index)
-    selected_currency = selected_currency_option.split(' ')[0]
-    currency_symbol = CURRENCIES[selected_currency]['symbol']
-    
-    # Get exchange rate
-    exchange_rate = get_exchange_rate(selected_currency)
     
     st.sidebar.subheader("📅 Date Range")
     col1, col2 = st.sidebar.columns(2)
@@ -855,13 +858,9 @@ def main():
         st.session_state.prev_start_date = start_date
         st.session_state.prev_end_date = end_date
     
-    st.sidebar.subheader("💰 Investment")
-    initial_capital_input = st.sidebar.number_input(f"Initial Investment ({currency_symbol})", min_value=100, value=10000, step=1000)
-    monthly_contribution_input = st.sidebar.number_input(f"Monthly Contribution ({currency_symbol})", min_value=0, value=0, step=50)
-    
-    # Convert inputs from selected currency to USD for internal calculations
-    initial_capital = initial_capital_input / exchange_rate if exchange_rate > 0 else initial_capital_input
-    monthly_contribution = monthly_contribution_input / exchange_rate if exchange_rate > 0 else monthly_contribution_input
+    st.sidebar.subheader("💰 Investment (EUR)")
+    initial_capital = st.sidebar.number_input("Initial Investment (€)", min_value=100, value=10000, step=1000)
+    monthly_contribution = st.sidebar.number_input("Monthly Contribution (€)", min_value=0, value=0, step=50)
     
     # Additional investments
     st.sidebar.subheader("💵 Additional Investments")
@@ -885,7 +884,7 @@ def main():
             st.session_state.additional_investments[i]['date'] = new_date
         with col2:
             new_amount = col2.number_input(
-                f"{currency_symbol} {i+1}",
+                f"€ {i+1}",
                 min_value=0,
                 value=inv['amount'],
                 step=1000,
@@ -908,9 +907,7 @@ def main():
         })
         st.rerun()
     
-    # Convert to list for backtest (convert from selected currency to USD)
-    additional_investments = [(inv['date'], inv['amount'] / exchange_rate if exchange_rate > 0 else inv['amount']) 
-                              for inv in st.session_state.additional_investments]
+    additional_investments = [(inv['date'], inv['amount']) for inv in st.session_state.additional_investments]
     
     st.sidebar.subheader("📊 Strategy Mode")
     strategy_mode = st.sidebar.radio("Mode", ["Automatic", "Manual"], horizontal=True)
@@ -999,17 +996,13 @@ def main():
         st.sidebar.error("Start date must be before end date!")
         return
     
-    st.sidebar.subheader("💸 Transaction Fee")
-    transaction_fee = st.sidebar.number_input("Fee (%)", min_value=0.0, max_value=10.0, value=0.3, step=0.1, format="%.2f") / 100
-    
-    st.sidebar.subheader("⚖️ Unit")
-    weight_unit = st.sidebar.radio("Display weight in", ["g (grams)", "oz (ounces)"], horizontal=True)
-    use_grams = weight_unit == "g (grams)"
-    oz_to_g = 31.1035  # conversion factor
+    st.sidebar.subheader("💸 Fees")
+    transaction_fee = st.sidebar.number_input("Transaction Fee (%)", min_value=0.0, max_value=10.0, value=0.3, step=0.1, format="%.2f") / 100
+    storage_fee_monthly = st.sidebar.number_input("Storage Fee (%/month)", min_value=0.0, max_value=5.0, value=0.0, step=0.01, format="%.2f", help="Monthly fee charged for storing physical metals (e.g., 0.05% = 0.6% annually)") / 100
     
     # Fetch and process data first (needed for fallback)
     with st.spinner("Fetching market data..."):
-        ratio_data, trading_data = fetch_data(str(start_date), str(end_date))
+        ratio_data, trading_data, eurusd_series = fetch_data(str(start_date), str(end_date))
     
     if len(ratio_data) == 0:
         st.error("No data available for the selected date range.")
@@ -1017,23 +1010,31 @@ def main():
     
     # Live ratio display (with fallback to most recent historical data)
     live_ratio, gold_price_usd, silver_price_usd = get_live_ratio()
+    last_hist_date = ratio_data.index[-1].strftime("%Y-%m-%d")
+    spot_eurusd = get_spot_eurusd()
+    if spot_eurusd is None or spot_eurusd <= 0:
+        spot_eurusd = float(eurusd_series.iloc[-1]) if len(eurusd_series) else 1.0
     
-    # Use historical data as fallback if live data unavailable
-    is_live = live_ratio is not None
-    if not is_live:
+    is_live = (
+        live_ratio is not None
+        and gold_price_usd is not None
+        and silver_price_usd is not None
+        and gold_price_usd > 0
+        and silver_price_usd > 0
+    )
+    if is_live:
+        gold_price_display = (gold_price_usd / spot_eurusd) / OZ_TO_G
+        silver_price_display = (silver_price_usd / spot_eurusd) / OZ_TO_G
+        ratio_label = "Current Gold/Silver Ratio"
+    else:
         live_ratio = ratio_data['ratio'].iloc[-1]
-        gold_price_usd = ratio_data['gold_price'].iloc[-1]
-        silver_price_usd = ratio_data['silver_price'].iloc[-1]
-        last_date = ratio_data.index[-1].strftime("%Y-%m-%d")
-    
-    # Convert prices to selected currency
-    gold_price_display = gold_price_usd * exchange_rate
-    silver_price_display = silver_price_usd * exchange_rate
+        gold_price_display = ratio_data['gold_price'].iloc[-1] / OZ_TO_G
+        silver_price_display = ratio_data['silver_price'].iloc[-1] / OZ_TO_G
+        ratio_label = f"Latest Gold/Silver Ratio ({last_hist_date})"
     
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        ratio_label = "Current Gold/Silver Ratio" if is_live else f"Latest Gold/Silver Ratio ({last_date})"
         st.markdown(f"""
         <div class="metric-card" style="padding: 2rem;">
             <div class="metric-value-large">{live_ratio:.2f}</div>
@@ -1044,20 +1045,20 @@ def main():
     with col2:
         st.markdown(f"""
         <div class="metric-card gold-metric" style="padding: 0.8rem; margin-bottom: 0.5rem;">
-            <div class="metric-value-small">{format_currency(gold_price_display, selected_currency)}</div>
-            <div class="metric-label-small">Gold (per oz)</div>
+            <div class="metric-value-small">{format_eur(gold_price_display)}</div>
+            <div class="metric-label-small">Gold (per g)</div>
         </div>
         """, unsafe_allow_html=True)
         st.markdown(f"""
         <div class="metric-card silver-metric" style="padding: 0.8rem;">
-            <div class="metric-value-small">{format_currency(silver_price_display, selected_currency)}</div>
-            <div class="metric-label-small">Silver (per oz)</div>
+            <div class="metric-value-small">{format_eur(silver_price_display)}</div>
+            <div class="metric-label-small">Silver (per g)</div>
         </div>
         """, unsafe_allow_html=True)
     
     # Show warning if using historical data
     if not is_live:
-        st.caption("⚠️ Live prices unavailable. Showing most recent historical data.")
+        st.caption("⚠️ Live prices unavailable. Showing most recent historical data (EUR using that day's EUR/USD).")
     
     # Current action recommendation (only in automatic mode)
     if upper_threshold is not None and lower_threshold is not None:
@@ -1086,11 +1087,12 @@ def main():
     st.markdown("---")
     
     # Run backtest
-    portfolio_df, trades, total_contributions = run_backtest(
+    portfolio_df, trades, total_contributions, total_storage_fees = run_backtest(
         ratio_data, trading_data,
         initial_capital, monthly_contribution,
         upper_threshold, lower_threshold,
         transaction_fee,
+        storage_fee_monthly,
         additional_investments,
         manual_trades
     )
@@ -1105,11 +1107,11 @@ def main():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Invested", format_currency(metrics['total_contributions'] * exchange_rate, selected_currency, 0))
+        st.metric("Total Invested", format_eur(metrics['total_contributions'], 0))
     with col2:
-        st.metric("Final Value", format_currency(metrics['final_value'] * exchange_rate, selected_currency, 0))
+        st.metric("Final Value", format_eur(metrics['final_value'], 0))
     with col3:
-        st.metric("Profit", format_currency(metrics['profit'] * exchange_rate, selected_currency, 0), 
+        st.metric("Profit", format_eur(metrics['profit'], 0), 
                   delta=f"{metrics['total_return']:.1f}%")
     with col4:
         st.metric("Annual Return", f"{metrics['annualized_return']:.2f}%")
@@ -1136,13 +1138,12 @@ def main():
     ratio_chart = create_ratio_chart(ratio_data, portfolio_df, trades, upper_threshold, lower_threshold)
     st.plotly_chart(ratio_chart, use_container_width=True)
     
-    unit_label = "Grams" if use_grams else "Ounces"
-    st.subheader(f"⚖️ Metal Holdings ({unit_label})")
-    ounces_chart = create_ounces_chart(portfolio_df, trades, use_grams)
-    st.plotly_chart(ounces_chart, use_container_width=True)
+    st.subheader("⚖️ Metal Holdings (g)")
+    holdings_chart = create_holdings_grams_chart(portfolio_df, trades)
+    st.plotly_chart(holdings_chart, use_container_width=True)
     
     st.subheader("💹 Portfolio Value")
-    portfolio_chart = create_portfolio_chart(portfolio_df, trading_data, initial_capital, exchange_rate, currency_symbol)
+    portfolio_chart = create_portfolio_chart(portfolio_df, trading_data, initial_capital)
     st.plotly_chart(portfolio_chart, use_container_width=True)
     
     # Trade History
@@ -1150,52 +1151,45 @@ def main():
     
     if trades:
         trade_data = []
-        unit = "g" if use_grams else "oz"
-        multiplier = oz_to_g if use_grams else 1
-        price_divisor = oz_to_g if use_grams else 1  # Convert price per oz to price per g
         
         for i, trade in enumerate(trades):
-            gold_weight = trade.gold_ounces * multiplier
-            silver_weight = trade.silver_ounces * multiplier
+            gold_weight = trade.gold_ounces * OZ_TO_G
+            silver_weight = trade.silver_ounces * OZ_TO_G
             
-            # Determine which asset was bought and its price per unit
             if trade.gold_ounces > 0 and trade.silver_ounces == 0:
-                # Bought gold only
-                price_per_unit = (trade.gold_price * exchange_rate) / price_divisor
-                price_str = f"{currency_symbol}{price_per_unit:.2f}/{unit}"
+                price_per_g = trade.gold_price / OZ_TO_G
+                price_str = f"€{price_per_g:.2f}/g"
             elif trade.silver_ounces > 0 and trade.gold_ounces == 0:
-                # Bought silver only
-                price_per_unit = (trade.silver_price * exchange_rate) / price_divisor
-                price_str = f"{currency_symbol}{price_per_unit:.2f}/{unit}"
+                price_per_g = trade.silver_price / OZ_TO_G
+                price_str = f"€{price_per_g:.2f}/g"
             else:
-                # Bought both (show both prices)
-                gold_ppu = (trade.gold_price * exchange_rate) / price_divisor
-                silver_ppu = (trade.silver_price * exchange_rate) / price_divisor
-                price_str = f"Au:{currency_symbol}{gold_ppu:.2f} Ag:{currency_symbol}{silver_ppu:.2f}/{unit}"
+                gold_ppg = trade.gold_price / OZ_TO_G
+                silver_ppg = trade.silver_price / OZ_TO_G
+                price_str = f"Au:€{gold_ppg:.2f} Ag:€{silver_ppg:.2f}/g"
             
             trade_data.append({
                 "Date": trade.date.strftime("%Y-%m-%d"),
                 "Action": trade.action.replace("_", " "),
                 "Ratio": f"{trade.ratio:.2f}",
-                f"Price/{unit}": price_str,
-                f"Gold ({unit})": f"{gold_weight:.2f}" if trade.gold_ounces > 0 else "-",
-                f"Silver ({unit})": f"{silver_weight:.2f}" if trade.silver_ounces > 0 else "-",
-                "Portfolio Value": format_currency(trade.portfolio_value * exchange_rate, selected_currency),
-                "Fee": format_currency(trade.transaction_cost * exchange_rate, selected_currency)
+                "Price/g": price_str,
+                "Gold (g)": f"{gold_weight:.2f}" if trade.gold_ounces > 0 else "-",
+                "Silver (g)": f"{silver_weight:.2f}" if trade.silver_ounces > 0 else "-",
+                "Portfolio Value": format_eur(trade.portfolio_value),
+                "Fee": format_eur(trade.transaction_cost)
             })
         
         st.dataframe(pd.DataFrame(trade_data), use_container_width=True, hide_index=True)
         
-        total_fees = sum(t.transaction_cost for t in trades)
-        st.info(f"**Total Trades:** {len(trades)} | **Total Fees Paid:** {format_currency(total_fees * exchange_rate, selected_currency)}")
+        total_tx_fees = sum(t.transaction_cost for t in trades)
+        storage_fees_display = f" | **Storage Fees:** {format_eur(total_storage_fees)}" if total_storage_fees > 0 else ""
+        st.info(f"**Total Trades:** {len(trades)} | **Transaction Fees:** {format_eur(total_tx_fees)}{storage_fees_display}")
     
     # Footer
     st.markdown("---")
-    exchange_rate_note = f" | Exchange rate: 1 USD = {exchange_rate:.4f} {selected_currency}" if selected_currency != 'USD' else ""
-    st.markdown(f"""
+    st.markdown("""
     <div style="text-align: center; color: #888; font-size: 0.9rem;">
-        <p>Data source: Yahoo Finance (GC=F, SI=F futures) | Updated daily{exchange_rate_note}</p>
-        <p>⚠️ This is for educational purposes only. Past performance does not guarantee future results.</p>
+        <p>Data: Yahoo Finance (GC=F, SI=F futures). Amounts in EUR; futures quoted per troy oz, converted with <strong>daily</strong> EUR/USD (EURUSD=X). Metal weights and spot cards shown in <strong>grams</strong> (1 oz t = 31.1035 g).</p>
+        <p>⚠️ For educational purposes only. Past performance does not guarantee future results.</p>
     </div>
     """, unsafe_allow_html=True)
 
